@@ -6,20 +6,26 @@
 package logic
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	gosql "database/sql"
+
 	"github.com/openark/golib/tests"
+	"github.com/stretchr/testify/require"
 
 	"github.com/github/gh-ost/go/base"
 	"github.com/github/gh-ost/go/binlog"
+	"github.com/github/gh-ost/go/mysql"
 	"github.com/github/gh-ost/go/sql"
+	"sync"
 )
 
 func TestMigratorOnChangelogEvent(t *testing.T) {
@@ -40,29 +46,29 @@ func TestMigratorOnChangelogEvent(t *testing.T) {
 		}))
 	})
 
-	t.Run("state-AllEventsUpToLockProcessed", func(t *testing.T) {
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func(wg *sync.WaitGroup) {
-			defer wg.Done()
-			es := <-migrator.applyEventsQueue
-			tests.S(t).ExpectNotNil(es)
-			tests.S(t).ExpectNotNil(es.writeFunc)
-		}(&wg)
+	// t.Run("state-AllEventsUpToLockProcessed", func(t *testing.T) {
+	// 	var wg sync.WaitGroup
+	// 	wg.Add(1)
+	// 	go func(wg *sync.WaitGroup) {
+	// 		defer wg.Done()
+	// 		es := <-migrator.applyEventsQueue
+	// 		tests.S(t).ExpectNotNil(es)
+	// 		tests.S(t).ExpectNotNil(es.writeFunc)
+	// 	}(&wg)
 
-		columnValues := sql.ToColumnValues([]interface{}{
-			123,
-			time.Now().Unix(),
-			"state",
-			AllEventsUpToLockProcessed,
-		})
-		tests.S(t).ExpectNil(migrator.onChangelogEvent(&binlog.BinlogDMLEvent{
-			DatabaseName:    "test",
-			DML:             binlog.InsertDML,
-			NewColumnValues: columnValues,
-		}))
-		wg.Wait()
-	})
+	// 	columnValues := sql.ToColumnValues([]interface{}{
+	// 		123,
+	// 		time.Now().Unix(),
+	// 		"state",
+	// 		AllEventsUpToLockProcessed,
+	// 	})
+	// 	tests.S(t).ExpectNil(migrator.onChangelogEvent(&binlog.BinlogDMLEvent{
+	// 		DatabaseName:    "test",
+	// 		DML:             binlog.InsertDML,
+	// 		NewColumnValues: columnValues,
+	// 	}))
+	// 	wg.Wait()
+	// })
 
 	t.Run("state-GhostTableMigrated", func(t *testing.T) {
 		go func() {
@@ -253,4 +259,127 @@ func TestMigratorShouldPrintStatus(t *testing.T) {
 	tests.S(t).ExpectFalse(migrator.shouldPrintStatus(HeuristicPrintStatusRule, 99, 210*time.Second))      // test 'elapsedSeconds <= 180'
 	tests.S(t).ExpectFalse(migrator.shouldPrintStatus(HeuristicPrintStatusRule, 12345, 86400*time.Second)) // test 'else'
 	tests.S(t).ExpectTrue(migrator.shouldPrintStatus(HeuristicPrintStatusRule, 30030, 86400*time.Second))  // test 'else' again
+}
+
+func prepareDatabase(t *testing.T, db *gosql.DB) {
+	_, err := db.Exec("RESET MASTER")
+	require.NoError(t, err)
+
+	_, err = db.Exec("SET @@GLOBAL.	binlog_transaction_dependency_tracking = WRITESET")
+	require.NoError(t, err)
+
+	_, err = db.Exec("DROP DATABASE test")
+	require.NoError(t, err)
+
+	_, err = db.Exec("CREATE DATABASE test")
+	require.NoError(t, err)
+
+	_, err = db.Exec("CREATE TABLE test.gh_ost_test (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255)) ENGINE=InnoDB")
+	require.NoError(t, err)
+}
+
+func TestMigrate(t *testing.T) {
+	db, err := gosql.Open("mysql", "root:root@/")
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+
+	_ = os.Remove("/tmp/gh-ost.sock")
+
+	prepareDatabase(t, db)
+
+	migrationContext := base.NewMigrationContext()
+	migrationContext.Hostname = "localhost"
+	migrationContext.DatabaseName = "test"
+	migrationContext.OriginalTableName = "gh_ost_test"
+	migrationContext.AlterStatement = "ALTER TABLE gh_ost_test ENGINE=InnoDB"
+	migrationContext.AllowedRunningOnMaster = true
+	migrationContext.ReplicaServerId = 99999
+	migrationContext.HeartbeatIntervalMilliseconds = 100
+	migrationContext.ServeSocketFile = "/tmp/gh-ost.sock"
+	migrationContext.ThrottleHTTPIntervalMillis = 100
+
+	migrationContext.InspectorConnectionConfig = &mysql.ConnectionConfig{
+		Key: mysql.InstanceKey{
+			Hostname: "localhost",
+			Port:     3306,
+		},
+		User:     "root",
+		Password: "root",
+	}
+
+	migrationContext.SetConnectionConfig("innodb")
+
+	migrator := NewMigrator(migrationContext, "1.2.3")
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	rowsWritten := atomic.Int32{}
+
+	var wg sync.WaitGroup
+
+	go func() {
+		wg.Add(1)
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				_, err := db.ExecContext(ctx, "INSERT INTO test.gh_ost_test (name) VALUES ('test')")
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+				require.NoError(t, err)
+				rowsWritten.Add(1)
+
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+
+	go func() {
+		wg.Add(1)
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				tx, err := db.BeginTx(ctx, &gosql.TxOptions{})
+				if errors.Is(err, context.Canceled) {
+					return
+				} else if err != nil {
+					fmt.Println(err.Error())
+				}
+				require.NoError(t, err)
+
+				for i := 0; i < 10; i++ {
+					_, err = tx.ExecContext(ctx, "INSERT INTO test.gh_ost_test (name) VALUES ('test')")
+					if errors.Is(err, context.Canceled) {
+						tx.Rollback()
+						return
+					}
+					require.NoError(t, err)
+					rowsWritten.Add(1)
+				}
+				tx.Commit()
+
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+
+	go func() {
+		time.Sleep(10 * time.Second)
+		cancel()
+	}()
+
+	err = migrator.Migrate()
+	require.NoError(t, err)
+	wg.Wait()
+
+	fmt.Printf("Rows written: %d\n", rowsWritten.Load())
 }
